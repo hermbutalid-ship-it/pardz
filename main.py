@@ -1275,6 +1275,98 @@ async def delete_order(
 
 
 @bot.tree.command(
+    name="view_all_transactions",
+    description="View a detailed list of all recorded order transactions.",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def view_all_transactions(interaction: discord.Interaction):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            order_id,
+            user,
+            customer,
+            item,
+            quantity,
+            price,
+            total_price,
+            status,
+            timestamp
+        FROM orders
+        ORDER BY order_id DESC
+        """
+    )
+    orders = cursor.fetchall()
+    conn.close()
+
+    if not orders:
+        await interaction.response.send_message(
+            "📋 Walang recorded transactions/orders sa database.",
+            ephemeral=True,
+        )
+        return
+
+    # Discord allows up to 25 fields per embed. Using 10 orders per embed
+    # keeps the transaction list readable and leaves room for long customer/item names.
+    chunks = [orders[i:i + 10] for i in range(0, len(orders), 10)]
+    total_pages = len(chunks)
+
+    def build_transaction_embed(chunk, page_number):
+        embed = discord.Embed(
+            title="📋 All Transactions",
+            description=(
+                f"Detailed list ng lahat ng recorded orders.\n"
+                f"Page **{page_number}/{total_pages}** • Total orders: **{len(orders)}**"
+            ),
+            color=discord.Color.blue(),
+        )
+
+        for order in chunk:
+            (
+                order_id,
+                logged_by,
+                customer,
+                item,
+                quantity,
+                unit_price,
+                total_price,
+                status,
+                timestamp,
+            ) = order
+
+            embed.add_field(
+                name=f"🧾 Order #{order_id} • {status}",
+                value=(
+                    f"**Customer:** {customer}\n"
+                    f"**Item:** {item}\n"
+                    f"**Quantity:** {quantity}\n"
+                    f"**Unit Price:** {format_price(unit_price)}\n"
+                    f"**Total Price:** {format_price(total_price)}\n"
+                    f"**Logged By:** {logged_by}\n"
+                    f"**Date:** {timestamp}"
+                ),
+                inline=False,
+            )
+
+        embed.set_footer(text="Use /view_all_transactions anytime to refresh the list.")
+        return embed
+
+    await interaction.response.send_message(
+        embed=build_transaction_embed(chunks[0], 1)
+    )
+
+    # Send remaining pages as follow-up messages. This avoids exceeding Discord's
+    # per-message embed limits while still showing every transaction.
+    for page_number, chunk in enumerate(chunks[1:], start=2):
+        await interaction.followup.send(
+            embed=build_transaction_embed(chunk, page_number)
+        )
+
+
+@bot.tree.command(
     name="export_orders",
     description="Export all logged lobby orders directly to an Excel file.",
 )

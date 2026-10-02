@@ -58,6 +58,35 @@ def init_db():
         """
     )
 
+    # Configuration table for the channel where photo approvals are posted.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS approval_config (
+            guild_id INTEGER PRIMARY KEY,
+            approval_channel_id INTEGER NOT NULL
+        )
+        """
+    )
+
+    # Photo approval requests.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS approval_requests (
+            approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            creator_id INTEGER NOT NULL,
+            creator_name TEXT NOT NULL,
+            customer TEXT NOT NULL,
+            photo_filename TEXT NOT NULL,
+            status TEXT NOT NULL,
+            message_id INTEGER,
+            channel_id INTEGER,
+            timestamp TEXT NOT NULL,
+            rejection_reason TEXT
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -86,6 +115,227 @@ def get_follow_up_channel_id(guild_id: int):
     result = cursor.fetchone()
     conn.close()
     return result[0] if result else None
+
+
+def get_approval_channel_id(guild_id: int):
+    """Retrieves the configured photo approval channel ID for a guild."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT approval_channel_id FROM approval_config WHERE guild_id = ?",
+        (guild_id,),
+    )
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+
+class ApprovalRejectModal(discord.ui.Modal):
+    """Modal used to collect the reason when an approval is rejected."""
+
+    def __init__(self, approval_id: int):
+        super().__init__(title="Reject Photo Approval")
+        self.approval_id = approval_id
+
+        self.reason = discord.ui.TextInput(
+            label="Reason for rejection",
+            placeholder="Enter the reason that should be sent to the member...",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            min_length=1,
+            max_length=1000,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = str(self.reason.value).strip()
+
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT creator_id, customer, status, message_id, channel_id
+            FROM approval_requests
+            WHERE approval_id = ?
+            """,
+            (self.approval_id,),
+        )
+        approval = cursor.fetchone()
+
+        if not approval:
+            conn.close()
+            await interaction.response.send_message(
+                "❌ This approval request no longer exists.",
+                ephemeral=True,
+            )
+            return
+
+        creator_id, customer, status, message_id, channel_id = approval
+
+        if status != "Pending":
+            conn.close()
+            await interaction.response.send_message(
+                f"⚠️ This request has already been processed as **{status}**.",
+                ephemeral=True,
+            )
+            return
+
+        cursor.execute(
+            """
+            UPDATE approval_requests
+            SET status = ?, rejection_reason = ?
+            WHERE approval_id = ?
+            """,
+            ("Rejected", reason, self.approval_id),
+        )
+        conn.commit()
+        conn.close()
+
+        # Acknowledge the modal first so Discord does not time out.
+        await interaction.response.defer(ephemeral=True)
+
+        # Delete the approval message. This also removes the uploaded photo
+        # from the to-be-approved channel.
+        deleted = False
+        try:
+            if interaction.message:
+                await interaction.message.delete()
+                deleted = True
+            elif channel_id and message_id:
+                channel = interaction.guild.get_channel(channel_id)
+                if channel:
+                    message = await channel.fetch_message(message_id)
+                    await message.delete()
+                    deleted = True
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            print(f"Could not delete rejected approval message #{self.approval_id}: {e}")
+
+        # DM the member who originally used /approval.
+        dm_sent = False
+        try:
+            creator = bot.get_user(creator_id) or await bot.fetch_user(creator_id)
+            await creator.send(
+                f"❌ Your photo approval for **{customer}** was rejected.\n"
+                f"**Reason:** {reason}"
+            )
+            dm_sent = True
+        except (discord.Forbidden, discord.HTTPException) as e:
+            print(f"Could not DM approval creator {creator_id}: {e}")
+
+        result = "❌ Rejected."
+        if not deleted:
+            result += " I could not delete the approval message."
+        if not dm_sent:
+            result += " I could not send the creator a DM."
+
+        await interaction.followup.send(result, ephemeral=True)
+
+
+class ApprovalView(discord.ui.View):
+    """Check/X buttons shown with every photo approval request."""
+
+    def __init__(self, approval_id: int, disabled: bool = False):
+        super().__init__(timeout=None)
+        self.approval_id = approval_id
+
+        check_button = discord.ui.Button(
+            label="Approve",
+            emoji="✅",
+            style=discord.ButtonStyle.success,
+            custom_id=f"approval_check_{approval_id}",
+            disabled=disabled,
+        )
+        x_button = discord.ui.Button(
+            label="Reject",
+            emoji="❌",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"approval_reject_{approval_id}",
+            disabled=disabled,
+        )
+
+        self.add_item(check_button)
+        self.add_item(x_button)
+
+
+async def handle_approval_check(interaction: discord.Interaction, approval_id: int):
+    """Approve an approval request and keep its photo in the channel."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT creator_id, customer, status
+        FROM approval_requests
+        WHERE approval_id = ?
+        """,
+        (approval_id,),
+    )
+    approval = cursor.fetchone()
+
+    if not approval:
+        conn.close()
+        await interaction.response.send_message(
+            "❌ This approval request no longer exists.",
+            ephemeral=True,
+        )
+        return
+
+    creator_id, customer, status = approval
+
+    if status != "Pending":
+        conn.close()
+        await interaction.response.send_message(
+            f"⚠️ This request has already been processed as **{status}**.",
+            ephemeral=True,
+        )
+        return
+
+    cursor.execute(
+        """
+        UPDATE approval_requests
+        SET status = ?
+        WHERE approval_id = ?
+        """,
+        ("Approved", approval_id),
+    )
+    conn.commit()
+    conn.close()
+
+    # Keep the message/photo in the channel, but disable the buttons.
+    if interaction.message:
+        try:
+            embed = interaction.message.embeds[0] if interaction.message.embeds else None
+            if embed:
+                embed.color = discord.Color.green()
+                embed.set_footer(
+                    text=f"Approved by {interaction.user} • "
+                         f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+            await interaction.response.edit_message(
+                embed=embed,
+                view=ApprovalView(approval_id, disabled=True),
+            )
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "✅ Approved, but I could not update the approval message.",
+                ephemeral=True,
+            )
+    else:
+        await interaction.response.send_message(
+            "✅ Approved.",
+            ephemeral=True,
+        )
+
+    # DM the member who originally used /approval.
+    try:
+        creator = bot.get_user(creator_id) or await bot.fetch_user(creator_id)
+        await creator.send(
+            f"✅ Your photo approval for **{customer}** has been approved by "
+            f"**{interaction.user}**."
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"Could not DM approval creator {creator_id}: {e}")
 
 
 class FollowUpView(discord.ui.View):
@@ -350,6 +600,9 @@ class OrderStatusView(discord.ui.View):
 async def on_ready():
     init_db()
     print(f"Logged in as {bot.user.name} (ID: {bot.user.id})")
+    # Approval buttons use custom IDs and are routed in on_interaction,
+    # so they continue working after a bot restart without registering
+    # one View instance for every approval request.
     bot.add_view(discord.ui.View(timeout=None))
 
     try:
@@ -363,6 +616,30 @@ async def on_ready():
 async def on_interaction(interaction: discord.Interaction):
     if interaction.type == discord.InteractionType.component:
         custom_id = interaction.data.get("custom_id", "")
+
+        if custom_id.startswith("approval_check_"):
+            if not interaction.user.guild_permissions.manage_messages:
+                await interaction.response.send_message(
+                    "⚠️ You need **Manage Messages** permission to approve photos.",
+                    ephemeral=True,
+                )
+                return
+
+            approval_id = int(custom_id.split("_")[2])
+            await handle_approval_check(interaction, approval_id)
+            return
+
+        if custom_id.startswith("approval_reject_"):
+            if not interaction.user.guild_permissions.manage_messages:
+                await interaction.response.send_message(
+                    "⚠️ You need **Manage Messages** permission to reject photos.",
+                    ephemeral=True,
+                )
+                return
+
+            approval_id = int(custom_id.split("_")[2])
+            await interaction.response.send_modal(ApprovalRejectModal(approval_id))
+            return
 
         if custom_id.startswith("btn_followup_"):
             order_id = int(custom_id.split("_")[2])
@@ -518,6 +795,197 @@ async def add_order(
                 f"Follow-up channel {follow_up_channel_id} could not be found "
                 f"in guild {interaction.guild_id}."
             )
+
+
+@bot.tree.command(
+    name="set_approval_channel",
+    description="Configure where /approval photo requests will be posted.",
+)
+@app_commands.describe(channel="The text channel to receive photo approval requests")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_approval_channel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO approval_config (guild_id, approval_channel_id)
+        VALUES (?, ?)
+        ON CONFLICT(guild_id)
+        DO UPDATE SET approval_channel_id = excluded.approval_channel_id
+        """,
+        (interaction.guild_id, channel.id),
+    )
+
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(
+        f"✅ Photo approval requests will now be posted in {channel.mention}."
+    )
+
+
+@bot.tree.command(
+    name="approval",
+    description="Submit a photo and customer for approval.",
+)
+@app_commands.describe(
+    photo="The photo that needs approval",
+    customer="The customer name or tag",
+)
+async def approval(
+    interaction: discord.Interaction,
+    photo: discord.Attachment,
+    customer: str,
+):
+    if not photo.content_type or not photo.content_type.startswith("image/"):
+        await interaction.response.send_message(
+            "❌ Please upload an image file for the photo.",
+            ephemeral=True,
+        )
+        return
+
+    approval_channel_id = get_approval_channel_id(interaction.guild_id)
+
+    if not approval_channel_id:
+        await interaction.response.send_message(
+            "❌ The approval channel has not been configured yet. "
+            "An administrator needs to use `/set_approval_channel` first.",
+            ephemeral=True,
+        )
+        return
+
+    approval_channel = interaction.guild.get_channel(approval_channel_id)
+
+    if not approval_channel:
+        await interaction.response.send_message(
+            "❌ The configured approval channel could not be found.",
+            ephemeral=True,
+        )
+        return
+
+    # Read the uploaded photo while the original slash-command attachment
+    # is still available, then upload a copy to the approval channel.
+    try:
+        photo_bytes = await photo.read()
+    except (discord.HTTPException, discord.NotFound) as e:
+        await interaction.response.send_message(
+            f"❌ I could not read the uploaded photo: {e}",
+            ephemeral=True,
+        )
+        return
+
+    filename = os.path.basename(photo.filename) or "approval_photo.png"
+    timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Create the DB row first so the approval ID can be used in button IDs.
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO approval_requests
+        (
+            guild_id,
+            creator_id,
+            creator_name,
+            customer,
+            photo_filename,
+            status,
+            timestamp
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            interaction.guild_id,
+            interaction.user.id,
+            str(interaction.user),
+            customer,
+            filename,
+            "Pending",
+            timestamp_str,
+        ),
+    )
+
+    approval_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    embed = discord.Embed(
+        title=f"🖼️ Photo Approval #{approval_id}",
+        description="A photo is waiting for approval.",
+        color=discord.Color.orange(),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.add_field(
+        name="👤 Customer",
+        value=f"**{customer}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="👨‍💻 Submitted By",
+        value=interaction.user.mention,
+        inline=True,
+    )
+    embed.add_field(
+        name="📊 Status",
+        value="**Pending Approval**",
+        inline=True,
+    )
+    embed.set_image(url=f"attachment://{filename}")
+    embed.set_footer(text=f"Approval #{approval_id} • {timestamp_str}")
+
+    try:
+        approval_file = discord.File(
+            fp=io.BytesIO(photo_bytes),
+            filename=filename,
+        )
+
+        approval_message = await approval_channel.send(
+            content="🔔 **New photo requires approval**",
+            embed=embed,
+            file=approval_file,
+            view=ApprovalView(approval_id),
+        )
+
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE approval_requests
+            SET message_id = ?, channel_id = ?
+            WHERE approval_id = ?
+            """,
+            (approval_message.id, approval_channel.id, approval_id),
+        )
+        conn.commit()
+        conn.close()
+
+    except (discord.Forbidden, discord.HTTPException) as e:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM approval_requests WHERE approval_id = ?",
+            (approval_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        await interaction.response.send_message(
+            f"❌ I could not post the photo in {approval_channel.mention}. "
+            f"Please check the bot's permissions.\n`{e}`",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ Your photo for **{customer}** was submitted to "
+        f"{approval_channel.mention} for approval.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(

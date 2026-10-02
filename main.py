@@ -5,7 +5,7 @@ import pandas as pd
 import datetime
 import io
 import sqlite3
-import os  # Added to load configuration from environment variables
+import os
 
 # Initialize bot with required intents
 intents = discord.Intents.default()
@@ -17,9 +17,7 @@ DB_FILE = "/data/orders.db"
 
 def init_db():
     """Initializes the SQLite database and creates the orders table if it doesn't exist."""
-    # Ensure the /data directory exists locally or in Railway volume mount
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-    
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
@@ -43,7 +41,6 @@ class OrderStatusView(discord.ui.View):
         self.order_id = order_id
         self.clear_items()
         
-        # Re-add buttons with order-specific custom IDs
         self.add_item(discord.ui.Button(label="Pending", style=discord.ButtonStyle.secondary, custom_id=f"btn_pending_{order_id}"))
         self.add_item(discord.ui.Button(label="On-Going", style=discord.ButtonStyle.primary, custom_id=f"btn_ongoing_{order_id}"))
         self.add_item(discord.ui.Button(label="Finish", style=discord.ButtonStyle.success, custom_id=f"btn_finish_{order_id}"))
@@ -132,6 +129,28 @@ async def add_order(interaction: discord.Interaction, item: str):
     
     view = OrderStatusView(order_id)
     await interaction.response.send_message(embed=embed, view=view)
+
+@bot.tree.command(name="delete_order", description="Remove an order completely from the lobby records.")
+@app_commands.describe(order_id="The numeric ID of the order you want to delete")
+async def delete_order(interaction: discord.Interaction, order_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Check if the order exists before trying to delete it
+    cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (order_id,))
+    order = cursor.fetchone()
+    
+    if not order:
+        await interaction.response.send_message(f"❌ Order #{order_id} could not be found in the system.", ephemeral=True)
+        conn.close()
+        return
+        
+    # Remove the record
+    cursor.execute("DELETE FROM orders WHERE order_id = ?", (order_id,))
+    conn.commit()
+    conn.close()
+    
+    await interaction.response.send_message(f"🗑️ Order #{order_id} has been permanently deleted from the database.")
 
 @bot.tree.command(name="export_orders", description="Export all logged lobby orders directly to an Excel file.")
 async def export_orders(interaction: discord.Interaction):

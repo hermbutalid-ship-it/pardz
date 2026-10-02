@@ -5,17 +5,21 @@ import pandas as pd
 import datetime
 import io
 import sqlite3
+import os  # Added to load configuration from environment variables
 
 # Initialize bot with required intents
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Change this line in your main.py file
+# Target the attached Railway persistent volume storage path
 DB_FILE = "/data/orders.db"
 
 def init_db():
     """Initializes the SQLite database and creates the orders table if it doesn't exist."""
+    # Ensure the /data directory exists locally or in Railway volume mount
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
@@ -36,7 +40,6 @@ class OrderStatusView(discord.ui.View):
     """
     def __init__(self, order_id: int):
         super().__init__(timeout=None)
-        # Setting custom_ids dynamically ensures the view can be re-registered on bot restart
         self.order_id = order_id
         self.clear_items()
         
@@ -50,23 +53,19 @@ class OrderStatusView(discord.ui.View):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
-        # Check if order exists
         cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (self.order_id,))
         if not cursor.fetchone():
             await interaction.response.send_message("This order no longer exists in the database.", ephemeral=True)
             conn.close()
             return
 
-        # Update status in SQLite
         cursor.execute("UPDATE orders SET status = ? WHERE order_id = ?", (new_status, self.order_id))
         conn.commit()
         conn.close()
         
-        # Edit the original embed to reflect the changes visually
         embed = interaction.message.embeds[0]
         embed.color = color_embed
         
-        # Find and update the Status field in the embed
         for i, field in enumerate(embed.fields):
             if field.name == "Status":
                 embed.set_field_at(i, name="Status", value=f"**{new_status}**", inline=True)
@@ -76,12 +75,9 @@ class OrderStatusView(discord.ui.View):
 
 @bot.event
 async def on_ready():
-    init_db()  # Setup database tables
+    init_db()
     print(f"Logged in as {bot.user.name} (ID: {bot.user.id})")
-    
-    # We must listen to raw interactions to handle old buttons after a reboot
     bot.add_view(discord.ui.View(timeout=None)) 
-    
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} application command(s).")
@@ -90,11 +86,9 @@ async def on_ready():
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
-    """Global handler to catch persistent button clicks across bot restarts."""
     if interaction.type == discord.InteractionType.component:
         custom_id = interaction.data.get("custom_id", "")
         if custom_id.startswith(("btn_pending_", "btn_ongoing_", "btn_finish_", "btn_pickup_")):
-            # Extract status type and order ID from custom_id
             parts = custom_id.split("_")
             status_type = parts[1]
             order_id = int(parts[2])
@@ -110,14 +104,12 @@ async def on_interaction(interaction: discord.Interaction):
             view = OrderStatusView(order_id)
             await view.handle_button_click(interaction, status_text, color)
 
-
 @bot.tree.command(name="add_order", description="Add a new item order to the lobby.")
 @app_commands.describe(item="The item details or description you want to order")
 async def add_order(interaction: discord.Interaction, item: str):
     timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     user_name = str(interaction.user)
     
-    # Insert order into database and retrieve the auto-generated ID
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
@@ -128,7 +120,6 @@ async def add_order(interaction: discord.Interaction, item: str):
     conn.commit()
     conn.close()
     
-    # Construct an interactive embed layout
     embed = discord.Embed(
         title=f"📋 Order #{order_id}", 
         description=f"New order added to the lobby.", 
@@ -139,15 +130,12 @@ async def add_order(interaction: discord.Interaction, item: str):
     embed.add_field(name="Ordered Item", value=item, inline=False)
     embed.set_footer(text=f"Placed at {timestamp_str}")
     
-    # Attach our status adjustment view with buttons
     view = OrderStatusView(order_id)
     await interaction.response.send_message(embed=embed, view=view)
-
 
 @bot.tree.command(name="export_orders", description="Export all logged lobby orders directly to an Excel file.")
 async def export_orders(interaction: discord.Interaction):
     conn = sqlite3.connect(DB_FILE)
-    # Pull directly from SQLite table into a Pandas DataFrame
     df = pd.read_sql_query("SELECT order_id AS 'Order ID', user AS 'Customer Username', item AS 'Ordered Item', status AS 'Current Status', timestamp AS 'Timestamp Created' FROM orders", conn)
     conn.close()
 
@@ -161,8 +149,11 @@ async def export_orders(interaction: discord.Interaction):
         excel_binary.seek(0)
         
         discord_file = discord.File(fp=excel_binary, filename=f"lobby_orders_{datetime.date.today()}.xlsx")
-        await interaction.response.send_message("Here is the requested permanent data sheet spreadsheet:", file=discord_file)
+        await interaction.response.send_message("Here is the requested data spreadsheet:", file=discord_file)
 
-
-# Paste your unique Discord Bot Application Token below to launch 
-# bot.run("YOUR_DISCORD_BOT_TOKEN")
+# Safe environmental variable check for Railway deployment
+token = os.environ.get("DISCORD_TOKEN")
+if token:
+    bot.run(token)
+else:
+    print("CRITICAL ERROR: 'DISCORD_TOKEN' environment variable is missing!")

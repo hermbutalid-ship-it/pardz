@@ -48,6 +48,16 @@ def init_db():
         """
     )
 
+    # Dedicated channel where every new order gets a follow-up card/button.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS follow_up_config (
+            guild_id INTEGER PRIMARY KEY,
+            follow_up_channel_id INTEGER NOT NULL
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -63,6 +73,132 @@ def get_logging_channel_id(guild_id: int):
     result = cursor.fetchone()
     conn.close()
     return result[0] if result else None
+
+
+def get_follow_up_channel_id(guild_id: int):
+    """Retrieves the configured follow-up channel ID for a specific guild."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT follow_up_channel_id FROM follow_up_config WHERE guild_id = ?",
+        (guild_id,),
+    )
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+
+class FollowUpView(discord.ui.View):
+    """Persistent view containing the Follow Up button for an order."""
+
+    def __init__(self, order_id: int):
+        super().__init__(timeout=None)
+        self.order_id = order_id
+
+        self.add_item(
+            discord.ui.Button(
+                label="Follow Up",
+                emoji="📞",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"btn_followup_{order_id}",
+            )
+        )
+
+
+    async def handle_button_click(self, interaction: discord.Interaction):
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT customer, item, price, status FROM orders WHERE order_id = ?",
+            (self.order_id,),
+        )
+        order_data = cursor.fetchone()
+
+        conn.close()
+
+        if not order_data:
+            await interaction.response.send_message(
+                "❌ This order no longer exists in the database.",
+                ephemeral=True,
+            )
+            return
+
+        customer, item_details, price, status = order_data
+
+        # Acknowledge the button immediately.
+        await interaction.response.send_message(
+            f"📞 Follow-up recorded for **Order #{self.order_id}** — **{customer}**.",
+            ephemeral=True,
+        )
+
+        # Update the follow-up card so staff can see that it was actioned.
+        try:
+            if interaction.message and interaction.message.embeds:
+                embed = interaction.message.embeds[0]
+                embed.set_footer(
+                    text=f"Last followed up by {interaction.user} • "
+                         f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+                updated_view = FollowUpView(self.order_id)
+                button = updated_view.children[0]
+                button.label = "Followed Up"
+                button.emoji = "✅"
+                button.style = discord.ButtonStyle.success
+
+                await interaction.message.edit(embed=embed, view=updated_view)
+        except Exception as e:
+            print(f"Could not update follow-up card: {e}")
+
+        # Send the follow-up alert to the configured logging channel.
+        log_channel_id = get_logging_channel_id(interaction.guild_id)
+
+        if log_channel_id:
+            log_channel = interaction.guild.get_channel(log_channel_id)
+
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="📞 Order Follow-Up",
+                    color=discord.Color.orange(),
+                    timestamp=datetime.datetime.now(),
+                )
+
+                log_embed.add_field(
+                    name="Order ID",
+                    value=f"#{self.order_id}",
+                    inline=True,
+                )
+                log_embed.add_field(
+                    name="Customer",
+                    value=customer,
+                    inline=True,
+                )
+                log_embed.add_field(
+                    name="Followed Up By",
+                    value=interaction.user.mention,
+                    inline=True,
+                )
+                log_embed.add_field(
+                    name="Current Status",
+                    value=status,
+                    inline=True,
+                )
+                log_embed.add_field(
+                    name="Item Details",
+                    value=item_details,
+                    inline=True,
+                )
+                log_embed.add_field(
+                    name="Price",
+                    value=price,
+                    inline=True,
+                )
+
+                await log_channel.send(
+                    content=f"📢 **Follow-up alert:** {customer}",
+                    embed=log_embed,
+                )
 
 
 class OrderStatusView(discord.ui.View):
@@ -228,6 +364,12 @@ async def on_interaction(interaction: discord.Interaction):
     if interaction.type == discord.InteractionType.component:
         custom_id = interaction.data.get("custom_id", "")
 
+        if custom_id.startswith("btn_followup_"):
+            order_id = int(custom_id.split("_")[2])
+            view = FollowUpView(order_id)
+            await view.handle_button_click(interaction)
+            return
+
         if custom_id.startswith(
             ("btn_pending_", "btn_ongoing_", "btn_finish_", "btn_pickup_")
         ):
@@ -322,6 +464,60 @@ async def add_order(
 
     view = OrderStatusView(order_id)
     await interaction.response.send_message(embed=embed, view=view)
+
+    # Also publish a dedicated follow-up card in the configured Follow Up channel.
+    follow_up_channel_id = get_follow_up_channel_id(interaction.guild_id)
+
+    if follow_up_channel_id:
+        follow_up_channel = interaction.guild.get_channel(follow_up_channel_id)
+
+        if follow_up_channel:
+            follow_up_embed = discord.Embed(
+                title=f"📞 Follow Up — Order #{order_id}",
+                description="A new order requires customer follow-up.",
+                color=discord.Color.orange(),
+            )
+
+            # Customer name is prominently shown beside the order information.
+            follow_up_embed.add_field(
+                name="👤 Customer",
+                value=f"**{final_customer}**",
+                inline=True,
+            )
+            follow_up_embed.add_field(
+                name="🧾 Order",
+                value=f"**#{order_id}**",
+                inline=True,
+            )
+            follow_up_embed.add_field(
+                name="💰 Price",
+                value=final_price,
+                inline=True,
+            )
+            follow_up_embed.add_field(
+                name="📦 Ordered Item",
+                value=item,
+                inline=False,
+            )
+            follow_up_embed.add_field(
+                name="📊 Status",
+                value="**Pending**",
+                inline=True,
+            )
+            follow_up_embed.set_footer(
+                text=f"Created by {user_name} • {timestamp_str}"
+            )
+
+            await follow_up_channel.send(
+                content=f"🔔 **New order follow-up:** {final_customer}",
+                embed=follow_up_embed,
+                view=FollowUpView(order_id),
+            )
+        else:
+            print(
+                f"Follow-up channel {follow_up_channel_id} could not be found "
+                f"in guild {interaction.guild_id}."
+            )
 
 
 @bot.tree.command(
@@ -418,6 +614,37 @@ async def set_logging_channel(
 
     await interaction.response.send_message(
         f"✅ Status update alerts will now be logged automatically in {channel.mention}."
+    )
+
+
+@bot.tree.command(
+    name="set_follow_up_channel",
+    description="Configure where new order follow-up cards will be posted.",
+)
+@app_commands.describe(channel="The text channel to receive new order follow-up cards")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_follow_up_channel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO follow_up_config (guild_id, follow_up_channel_id)
+        VALUES (?, ?)
+        ON CONFLICT(guild_id)
+        DO UPDATE SET follow_up_channel_id = excluded.follow_up_channel_id
+        """,
+        (interaction.guild_id, channel.id),
+    )
+
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(
+        f"✅ New order follow-up cards will now be posted automatically in {channel.mention}."
     )
 
 

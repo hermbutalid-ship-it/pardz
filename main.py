@@ -6,6 +6,7 @@ import datetime
 import io
 import sqlite3
 import os
+from decimal import Decimal, InvalidOperation
 
 
 # Initialize bot with required intents
@@ -15,6 +16,32 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Target the attached Railway persistent volume storage path
 DB_FILE = "/data/orders.db"
+
+
+def parse_price(value: str) -> Decimal:
+    """Parse a price such as 250, 250.50, ₱250, or $250.50."""
+    cleaned = str(value).strip().replace(",", "")
+    for symbol in ("₱", "$", "€", "£"):
+        cleaned = cleaned.replace(symbol, "")
+    if not cleaned:
+        return Decimal("0")
+    try:
+        amount = Decimal(cleaned)
+    except InvalidOperation as exc:
+        raise ValueError("Price must be a valid number.") from exc
+    if amount < 0:
+        raise ValueError("Price cannot be negative.")
+    return amount
+
+
+def format_price(value) -> str:
+    """Format a numeric price with two decimal places."""
+    amount = Decimal(str(value))
+    return f"{amount:,.2f}"
+
+
+def calculate_total_price(unit_price: str, quantity: int) -> Decimal:
+    return parse_price(unit_price) * Decimal(quantity)
 
 
 def init_db():
@@ -31,12 +58,23 @@ def init_db():
             user TEXT NOT NULL,
             customer TEXT NOT NULL,
             item TEXT NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1,
             price TEXT NOT NULL,
+            total_price TEXT NOT NULL DEFAULT '0',
             status TEXT NOT NULL,
             timestamp TEXT NOT NULL
         )
         """
     )
+
+    # Add quantity to older databases that were created before quantity existed.
+    cursor.execute("PRAGMA table_info(orders)")
+    order_columns = {row[1] for row in cursor.fetchall()}
+    if "quantity" not in order_columns:
+        cursor.execute("ALTER TABLE orders ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1")
+    if "total_price" not in order_columns:
+        cursor.execute("ALTER TABLE orders ADD COLUMN total_price TEXT NOT NULL DEFAULT '0'")
+        cursor.execute("UPDATE orders SET total_price = price * quantity")
 
     # Configuration table to hold the logging channel per server
     cursor.execute(
@@ -360,7 +398,7 @@ class FollowUpView(discord.ui.View):
         cursor = conn.cursor()
 
         cursor.execute(
-            "SELECT customer, item, price, status FROM orders WHERE order_id = ?",
+            "SELECT customer, item, price, quantity, total_price, status FROM orders WHERE order_id = ?",
             (self.order_id,),
         )
         order_data = cursor.fetchone()
@@ -374,7 +412,7 @@ class FollowUpView(discord.ui.View):
             )
             return
 
-        customer, item_details, price, status = order_data
+        customer, item_details, price, quantity, total_price, status = order_data
 
         # Acknowledge the button immediately.
         await interaction.response.send_message(
@@ -440,8 +478,18 @@ class FollowUpView(discord.ui.View):
                     inline=True,
                 )
                 log_embed.add_field(
-                    name="Price",
-                    value=price,
+                    name="Quantity",
+                    value=str(quantity),
+                    inline=True,
+                )
+                log_embed.add_field(
+                    name="Unit Price",
+                    value=format_price(price),
+                    inline=True,
+                )
+                log_embed.add_field(
+                    name="Total Price",
+                    value=format_price(total_price),
                     inline=True,
                 )
 
@@ -501,7 +549,7 @@ class OrderStatusView(discord.ui.View):
 
         # Verify the order exists
         cursor.execute(
-            "SELECT customer, item, price, status FROM orders WHERE order_id = ?",
+            "SELECT customer, item, price, quantity, total_price, status FROM orders WHERE order_id = ?",
             (self.order_id,),
         )
         order_data = cursor.fetchone()
@@ -514,7 +562,7 @@ class OrderStatusView(discord.ui.View):
             conn.close()
             return
 
-        customer, item_details, price, old_status = order_data
+        customer, item_details, price, quantity, total_price, old_status = order_data
 
         # Protect against duplicate double clicks
         if old_status == new_status:
@@ -588,8 +636,18 @@ class OrderStatusView(discord.ui.View):
                     inline=True,
                 )
                 log_embed.add_field(
-                    name="Price",
-                    value=price,
+                    name="Unit Price",
+                    value=format_price(price),
+                    inline=True,
+                )
+                log_embed.add_field(
+                    name="Quantity",
+                    value=str(quantity),
+                    inline=True,
+                )
+                log_embed.add_field(
+                    name="Total Price",
+                    value=format_price(total_price),
                     inline=True,
                 )
 
@@ -672,15 +730,23 @@ async def on_interaction(interaction: discord.Interaction):
 )
 @app_commands.describe(
     item="The item details or description you want to order",
+    quantity="Quantity of the item",
     customer="Name or tag of the customer (Optional)",
     price="The cost of the item (Optional)",
 )
 async def add_order(
     interaction: discord.Interaction,
     item: str,
+    quantity: int,
     customer: str = None,
     price: str = None,
 ):
+    if quantity < 1:
+        await interaction.response.send_message(
+            "❌ Quantity must be at least 1.", ephemeral=True
+        )
+        return
+
     timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     user_name = str(interaction.user)
 
@@ -688,20 +754,29 @@ async def add_order(
     final_customer = customer if customer else "Not Provided"
     final_price = price if price else "0"
 
+    try:
+        unit_price_decimal = parse_price(final_price)
+        total_price_decimal = calculate_total_price(final_price, quantity)
+    except ValueError as e:
+        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        return
+
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     cursor.execute(
         """
         INSERT INTO orders
-        (user, customer, item, price, status, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (user, customer, item, quantity, price, total_price, status, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_name,
             final_customer,
             item,
-            final_price,
+            quantity,
+            str(unit_price_decimal),
+            str(total_price_decimal),
             "Pending",
             timestamp_str,
         ),
@@ -723,8 +798,18 @@ async def add_order(
         inline=True,
     )
     embed.add_field(
-        name="Price",
-        value=final_price,
+        name="Unit Price",
+        value=format_price(unit_price_decimal),
+        inline=True,
+    )
+    embed.add_field(
+        name="Quantity",
+        value=str(quantity),
+        inline=True,
+    )
+    embed.add_field(
+        name="Total Price",
+        value=format_price(total_price_decimal),
         inline=True,
     )
     embed.add_field(
@@ -767,8 +852,18 @@ async def add_order(
                 inline=True,
             )
             follow_up_embed.add_field(
-                name="💰 Price",
-                value=final_price,
+                name="💰 Unit Price",
+                value=format_price(unit_price_decimal),
+                inline=True,
+            )
+            follow_up_embed.add_field(
+                name="💵 Total Price",
+                value=format_price(total_price_decimal),
+                inline=True,
+            )
+            follow_up_embed.add_field(
+                name="🔢 Quantity",
+                value=str(quantity),
                 inline=True,
             )
             follow_up_embed.add_field(
@@ -997,6 +1092,7 @@ async def approval(
     item="Update the item description (Optional)",
     customer="Update the customer name/tag (Optional)",
     price="Update the item price (Optional)",
+    quantity="Update the item quantity (Optional)",
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def edit_order(
@@ -1005,13 +1101,14 @@ async def edit_order(
     item: str = None,
     customer: str = None,
     price: str = None,
+    quantity: int = None,
 ):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     # Fetch existing data first
     cursor.execute(
-        "SELECT item, customer, price FROM orders WHERE order_id = ?",
+        "SELECT item, customer, price, quantity, total_price FROM orders WHERE order_id = ?",
         (order_id,),
     )
     existing = cursor.fetchone()
@@ -1028,17 +1125,34 @@ async def edit_order(
     updated_item = item if item else existing[0]
     updated_customer = customer if customer else existing[1]
     updated_price = price if price else existing[2]
+    updated_quantity = quantity if quantity is not None else existing[3]
+    if updated_quantity < 1:
+        await interaction.response.send_message(
+            "❌ Quantity must be at least 1.", ephemeral=True
+        )
+        conn.close()
+        return
+
+    try:
+        updated_price_decimal = parse_price(updated_price)
+        updated_total_price = calculate_total_price(updated_price, updated_quantity)
+    except ValueError as e:
+        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        conn.close()
+        return
 
     cursor.execute(
         """
         UPDATE orders
-        SET item = ?, customer = ?, price = ?
+        SET item = ?, customer = ?, price = ?, quantity = ?, total_price = ?
         WHERE order_id = ?
         """,
         (
             updated_item,
             updated_customer,
-            updated_price,
+            str(updated_price_decimal),
+            updated_quantity,
+            str(updated_total_price),
             order_id,
         ),
     )
@@ -1050,7 +1164,9 @@ async def edit_order(
         f"✅ **Order #{order_id} successfully updated!**\n"
         f"• **Customer:** {updated_customer}\n"
         f"• **Item:** {updated_item}\n"
-        f"• **Price:** {updated_price}"
+        f"• **Unit Price:** {format_price(updated_price_decimal)}\n"
+        f"• **Quantity:** {updated_quantity}\n"
+        f"• **Total Price:** {format_price(updated_total_price)}"
     )
 
 
@@ -1174,7 +1290,9 @@ async def export_orders(interaction: discord.Interaction):
             user AS 'Logged By',
             customer AS 'Customer Name/Tag',
             item AS 'Ordered Item',
-            price AS 'Price',
+            quantity AS 'Quantity',
+            price AS 'Unit Price',
+            total_price AS 'Total Price',
             status AS 'Current Status',
             timestamp AS 'Timestamp Created'
         FROM orders
